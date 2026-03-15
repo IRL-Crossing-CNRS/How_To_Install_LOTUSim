@@ -64,6 +64,33 @@ SCENARIO_WS="$HOME/Documents/workspace/lotusim"
 export LOTUSIM_WS LOTUSIM_SRC LOTUSIM_PATH SCENARIO_WS ROS_DISTRO
 
 # -----------------------------------------------------------------------------
+# Fix ROS 2 GPG key BEFORE the first apt-get update.
+# A previous failed run may have added the ROS repo without a key, which causes
+# "NO_PUBKEY" errors that abort apt update entirely and break everything below.
+# -----------------------------------------------------------------------------
+ROS_KEYRING="/usr/share/keyrings/ros-archive-keyring.gpg"
+ROS_SOURCES="/etc/apt/sources.list.d/ros2.list"
+
+info "Pre-installing ROS 2 GPG key before first apt update..."
+# Ensure curl is available for the key download
+if ! command -v curl &>/dev/null; then
+  sudo apt-get install -y --no-install-recommends curl 2>/dev/null || true
+fi
+sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+  -o "$ROS_KEYRING" \
+  || die "Failed to download ROS 2 GPG key. Check your internet connection."
+
+# Remove any unsigned/broken ROS repo entry left by a previous failed run
+sudo rm -f /etc/apt/sources.list.d/ros-latest.list
+
+# Write the repo entry with signed-by reference (idempotent — overwrites if present)
+echo "deb [arch=$(dpkg --print-architecture) signed-by=${ROS_KEYRING}] \
+http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" \
+  | sudo tee "$ROS_SOURCES" > /dev/null
+
+success "ROS 2 GPG key and signed repo entry configured"
+
+# -----------------------------------------------------------------------------
 # System dependencies (bootstrap only — ROS itself is installed by lotusim install)
 # -----------------------------------------------------------------------------
 info "Installing bootstrap system dependencies..."
@@ -73,9 +100,20 @@ sudo apt-get install -y --no-install-recommends \
   jq \
   curl \
   lsb-release \
-  python3-colcon-common-extensions \
   python3-pip
 success "Bootstrap dependencies installed"
+
+# colcon lives in the ROS apt repo, which may not exist yet on a fresh system.
+# Try apt first; fall back to pip if the package is unavailable.
+info "Installing colcon..."
+if apt-cache show python3-colcon-common-extensions &>/dev/null 2>&1; then
+  sudo apt-get install -y --no-install-recommends python3-colcon-common-extensions
+  success "colcon installed via apt"
+else
+  warn "python3-colcon-common-extensions not found in apt — installing via pip..."
+  pip3 install --break-system-packages colcon-common-extensions
+  success "colcon installed via pip"
+fi
 
 info "Installing Python dependencies..."
 pip3 install --break-system-packages pyarrow pandas matplotlib opencv-python
