@@ -4,6 +4,8 @@
 #  Ubuntu 24.04  →  ROS 2 Jazzy   (also works in WSL2 — see README)
 #  LOTUSim core + LOTUSim-generic-scenario
 #  Optional: PX4 SITL for aerial X500 drones (question 3 / INSTALL_PX4=1)
+#  Optional: YOLO detection on an NVIDIA GPU (question 4 / INSTALL_GPU=1)
+#  Unity player(s) to download (question 5 / INSTALL_UNITY_PLAYER=linux|windows|all)
 #
 #  Installs the LOTUSim core (~/lotusim_ws) and the generic scenario
 #  workspace (~/Documents/workspace/lotusim), built in their nix devshells,
@@ -269,6 +271,110 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# Question 4 — YOLO detection on the GPU (optional)
+#
+# The crack and corrosion detection tasks run on the CPU by default. On a
+# machine with an NVIDIA GPU and its driver, the scenario workspace's "gpu"
+# devshell runs them with CUDA instead, for about 7 GB more of downloads.
+# The choice is stored in ~/.config/lotusim/devshell ("default" or
+# "gpu"), which lotusim_shell reads; edit it to switch later.
+#
+# Non-interactive override: INSTALL_GPU=1 ./install_core_and_generic_scenario.sh
+# -----------------------------------------------------------------------------
+HAS_NVIDIA_GPU=0
+if command -v nvidia-smi &>/dev/null && nvidia-smi -L &>/dev/null; then
+  HAS_NVIDIA_GPU=1
+fi
+if [[ "${INSTALL_GPU:-}" == "1" || "${INSTALL_GPU:-}" == "0" ]]; then
+  INSTALL_GPU_FLAG="${INSTALL_GPU}"
+else
+  echo ""
+  echo "-------------------------------------------------------------"
+  echo "  Run the YOLO detection on an NVIDIA GPU?"
+  echo ""
+  echo "  Downloads NVIDIA's CUDA build of PyTorch (about 7 GB more)."
+  echo "  Without it the crack and corrosion detection runs on the CPU,"
+  echo "  slower but with the same results."
+  if [[ "$HAS_NVIDIA_GPU" == "1" ]]; then
+    echo "  An NVIDIA GPU was found on this machine."
+  else
+    echo "  No NVIDIA GPU (nvidia-smi) was found on this machine."
+  fi
+  echo "-------------------------------------------------------------"
+  if [[ "$HAS_NVIDIA_GPU" == "1" ]]; then GPU_PROMPT="[Y/n]"; GPU_DEFAULT="1"; else GPU_PROMPT="[y/N]"; GPU_DEFAULT="0"; fi
+  INSTALL_GPU_FLAG=""
+  while [[ -z "$INSTALL_GPU_FLAG" ]]; do
+    read -rp "Use the GPU for detection? ${GPU_PROMPT}: " yn
+    case "$yn" in
+      [yY]|[yY][eE][sS])  INSTALL_GPU_FLAG="1" ;;
+      [nN]|[nN][oO])      INSTALL_GPU_FLAG="0" ;;
+      "")                 INSTALL_GPU_FLAG="$GPU_DEFAULT" ;;
+      *) warn "Please answer y or n" ;;
+    esac
+  done
+fi
+if [[ "$INSTALL_GPU_FLAG" == "1" ]]; then
+  SCENARIO_DEVSHELL="gpu"
+  success "Detection: on the GPU"
+else
+  SCENARIO_DEVSHELL="default"
+  info "Detection: on the CPU (re-run with INSTALL_GPU=1 to use the GPU)"
+fi
+
+# -----------------------------------------------------------------------------
+# Question 5 — which Unity player to download
+#
+# The scenario repository ships the Unity player built for Linux and for
+# Windows, about 1 GB each, and Git LFS keeps a second copy of what it
+# downloads. Only the player this machine runs is needed: scenario_launch.sh
+# starts the Linux one on Linux and the Windows one under WSL (through
+# interop), so that is the default answer.
+#
+# Non-interactive override: INSTALL_UNITY_PLAYER=linux|windows|all
+# -----------------------------------------------------------------------------
+if grep -qi microsoft /proc/version 2>/dev/null; then
+  DETECTED_UNITY_PLAYER="windows"
+else
+  DETECTED_UNITY_PLAYER="linux"
+fi
+case "${INSTALL_UNITY_PLAYER:-}" in
+  linux|windows|all) UNITY_PLAYER="$INSTALL_UNITY_PLAYER" ;;
+  *)
+    echo ""
+    echo "-------------------------------------------------------------"
+    echo "  Which Unity player should be downloaded?"
+    echo ""
+    echo "  (1) Linux     (2) Windows     (3) both"
+    echo "  This machine runs the ${DETECTED_UNITY_PLAYER} one; each player is about"
+    echo "  1 GB, stored twice by Git LFS."
+    echo "-------------------------------------------------------------"
+    if [[ "$DETECTED_UNITY_PLAYER" == "windows" ]]; then UNITY_DEFAULT_CHOICE="2"; else UNITY_DEFAULT_CHOICE="1"; fi
+    UNITY_PLAYER=""
+    while [[ -z "$UNITY_PLAYER" ]]; do
+      read -rp "Enter your choice [1/2/3, default ${UNITY_DEFAULT_CHOICE}]: " choice
+      case "${choice:-$UNITY_DEFAULT_CHOICE}" in
+        1) UNITY_PLAYER="linux" ;;
+        2) UNITY_PLAYER="windows" ;;
+        3) UNITY_PLAYER="all" ;;
+        *) warn "Please answer 1, 2 or 3" ;;
+      esac
+    done
+    ;;
+esac
+if [[ "$UNITY_PLAYER" != "all" && "$UNITY_PLAYER" != "$DETECTED_UNITY_PLAYER" ]]; then
+  warn "Unity player: ${UNITY_PLAYER}, but scenario_launch.sh will look for the ${DETECTED_UNITY_PLAYER} one on this machine"
+fi
+success "Unity player: ${UNITY_PLAYER}"
+
+# git lfs pull and checkouts skip the excluded player, leaving its files as
+# small pointer files.
+case "$UNITY_PLAYER" in
+  linux)   UNITY_LFS_EXCLUDE="lotusim_unity_executables/*_windows/**" ;;
+  windows) UNITY_LFS_EXCLUDE="lotusim_unity_executables/*_linux/**" ;;
+  *)       UNITY_LFS_EXCLUDE="" ;;
+esac
+
+# -----------------------------------------------------------------------------
 # ROS 2 apt repository — only configure it if not already present.
 # -----------------------------------------------------------------------------
 ROS_KEYRING="/usr/share/keyrings/ros-archive-keyring.gpg"
@@ -382,10 +488,10 @@ success "LOTUSim on branch ${CORE_BRANCH}"
 BASHRC_MARKER="# >>> LOTUSim setup >>>"
 BASHRC_END="# <<< LOTUSim setup <<<"
 
-# A block written by an earlier installer (the apt-based one, whose
-# lotusim_core called launch/lotusim) is replaced rather than kept: it would
-# source a system ROS 2 and point at directories the core no longer has.
-if grep -qF "$BASHRC_MARKER" ~/.bashrc && ! grep -qF "lotusim_shell" ~/.bashrc; then
+# A block written by an earlier installer is replaced rather than kept: the
+# apt-based one sources a system ROS 2 and points at directories the core no
+# longer has, and the first nix one always opened the CPU devshell.
+if grep -qF "$BASHRC_MARKER" ~/.bashrc && ! grep -qF ".config/lotusim/devshell" ~/.bashrc; then
   info "Replacing the previous LOTUSim block in ~/.bashrc (backup: ~/.bashrc.lotusim.bak)..."
   cp ~/.bashrc ~/.bashrc.lotusim.bak
   sed -i "/^${BASHRC_MARKER}\$/,/^${BASHRC_END}\$/d" ~/.bashrc
@@ -410,10 +516,13 @@ lotusim_core() {
 
 # 'lotusim_shell' opens the scenario workspace's devshell, built
 # against the core, with both workspaces sourced: scenario_launch.sh is
-# run from there.
+# run from there. ~/.config/lotusim/devshell names the devshell:
+# "default" (detection on the CPU) or "gpu".
 lotusim_shell() {
+  local devshell
+  devshell="\$(cat "\$HOME/.config/lotusim/devshell" 2>/dev/null || echo default)"
   cd "\$LOTUSIM_SCENARIO_WS" && \\
-    nix develop --override-input lotusim "\$LOTUSIM_PATH" \\
+    nix develop ".#\$devshell" --override-input lotusim "\$LOTUSIM_PATH" \\
       --command bash --rcfile "\$HOME/.config/lotusim/shellrc"
 }
 # <<< LOTUSim setup <<<
@@ -427,6 +536,7 @@ fi
 # workspaces only, never ~/.bashrc: an older block there may source a system
 # ROS 2, which must not be mixed with the devshell's.
 mkdir -p "$HOME/.config/lotusim"
+echo "$SCENARIO_DEVSHELL" > "$HOME/.config/lotusim/devshell"
 cat > "$HOME/.config/lotusim/shellrc" <<'SHELLRC'
 PS1="(lotusim_core) $PS1"
 [[ -f "$LOTUSIM_PATH/install/setup.bash" ]] && source "$LOTUSIM_PATH/install/setup.bash"
@@ -516,7 +626,9 @@ cd "$SCENARIO_WS"
 
 if [[ ! -d "LOTUSim-generic-scenario/.git" ]]; then
   info "Cloning LOTUSim-generic-scenario (branch: ${SCENARIO_BRANCH})..."
-  git clone --recurse-submodules -b "$SCENARIO_BRANCH" "$SCENARIO_REPO_URL"
+  # Cloned without its LFS content: the player not chosen above is excluded
+  # before anything is downloaded.
+  GIT_LFS_SKIP_SMUDGE=1 git clone --recurse-submodules -b "$SCENARIO_BRANCH" "$SCENARIO_REPO_URL"
   success "Scenario repo cloned"
 else
   check_existing_remote "LOTUSim-generic-scenario" "$SCENARIO_REPO_URL"
@@ -537,7 +649,12 @@ success "LOTUSim-generic-scenario on branch ${SCENARIO_BRANCH}"
 git submodule update --init --remote --merge
 success "Submodules up to date"
 
-info "Ensuring all LFS content is fetched (Unity executables etc.)..."
+if [[ -n "$UNITY_LFS_EXCLUDE" ]]; then
+  git config lfs.fetchexclude "$UNITY_LFS_EXCLUDE"
+else
+  git config --unset lfs.fetchexclude 2>/dev/null || true
+fi
+info "Ensuring the LFS content is fetched (Unity ${UNITY_PLAYER} player, models)..."
 git lfs pull
 success "LFS content up to date"
 
@@ -559,7 +676,7 @@ PWD_SCENARIO="$PWD"
 # are built against one ROS 2 rather than against whatever github holds.
 info "Building LOTUSim generic scenario with colcon, in its devshell..."
 purge_foreign_colcon_artifacts "$PWD"
-( cd "$PWD_SCENARIO" && nix develop --override-input lotusim "$LOTUSIM_PATH" \
+( cd "$PWD_SCENARIO" && nix develop ".#$SCENARIO_DEVSHELL" --override-input lotusim "$LOTUSIM_PATH" \
     --command bash -c \
     "source '$LOTUSIM_PATH/install/setup.bash' && colcon build --symlink-install" ) \
   || die "Scenario build failed. Enter the shell yourself with: cd $PWD_SCENARIO && nix develop --override-input lotusim $LOTUSIM_PATH"
@@ -837,7 +954,7 @@ echo "=================================================================="
 echo "  LOTUSim Setup Completed!"
 echo ""
 echo "  Ubuntu ${UBUNTU_VERSION}  |  ROS 2 ${ROS_DISTRO^}"
-echo "  Usage mode: ${USAGE_MODE}  |  PX4 SITL: $([[ "$INSTALL_PX4_FLAG" == "1" ]] && echo yes || echo no)"
+echo "  Usage mode: ${USAGE_MODE}  |  PX4 SITL: $([[ "$INSTALL_PX4_FLAG" == "1" ]] && echo yes || echo no)  |  Detection: $([[ "$INSTALL_GPU_FLAG" == "1" ]] && echo GPU || echo CPU)  |  Unity player: ${UNITY_PLAYER}"
 echo "  Core branch: ${CORE_BRANCH}  |  Scenario branch: ${SCENARIO_BRANCH}"
 echo ""
 echo "  Core workspace:     ${LOTUSIM_WS}"

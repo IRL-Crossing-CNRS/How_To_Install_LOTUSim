@@ -17,10 +17,10 @@ program is left untouched.
 
 - Ubuntu 24.04 (fresh or existing install)
 - Internet access — the first entry into the flake downloads several GB
-- About 30 GB of free disk: the scenario environment alone is about 11 GB,
-  7 GB of it the CUDA build of PyTorch used by the YOLO detection tasks
-- For GPU detection, an NVIDIA GPU with its driver installed on the machine —
-  the environment brings CUDA itself, but uses the driver's `libcuda`
+- About 20 GB of free disk, 7 GB more if the detection runs on the GPU
+  (question 4)
+- For GPU detection only, an NVIDIA GPU with its driver installed on the
+  machine — the environment brings CUDA itself, but uses the driver's `libcuda`
 - `sudo` privileges (installing nix, and its ROS cache, needs root once)
 
 Both repositories are public and cloned over HTTPS: no account or key is
@@ -39,7 +39,7 @@ chmod +x install_core_and_generic_scenario.sh
 ./install_core_and_generic_scenario.sh
 ```
 
-As soon as SSH access to both repositories is confirmed, the script asks three questions:
+Once both repositories are confirmed reachable, the script asks five questions:
 
 1. **Usage mode** — how do you intend to use LOTUSim?
    - `(1)` **User** — a black box to test some algorithms, plug and play
@@ -54,11 +54,25 @@ As soon as SSH access to both repositories is confirmed, the script asks three q
    [PX4 SITL support](#px4-sitl-support-aerial-drones)). Non-interactive
    override: `INSTALL_PX4=1 ./install_core_and_generic_scenario.sh`
    (or `INSTALL_PX4=0` to skip the question).
+4. **GPU detection** — `Use the GPU for detection?` — the YOLO crack and
+   corrosion detection runs on the CPU by default; answering yes downloads
+   NVIDIA's CUDA build of PyTorch (about 7 GB more) and runs it on the GPU.
+   The default answer is yes when `nvidia-smi` finds a GPU. The choice is
+   stored in `~/.config/lotusim/devshell` (`default` or `gpu`), which
+   `lotusim_shell` reads: edit it to switch later. Non-interactive
+   override: `INSTALL_GPU=1` (or `INSTALL_GPU=0`).
+5. **Unity player** — Linux, Windows or both. The scenario repository ships
+   both builds, about 1 GB each and stored twice by Git LFS; only the chosen
+   one is downloaded, the other stays as small LFS pointer files. The default
+   is the one `scenario_launch.sh` starts on this machine: Linux, or Windows
+   under WSL. Non-interactive override: `INSTALL_UNITY_PLAYER=linux|windows|all`.
+   To fetch the other one later: `git config --unset lfs.fetchexclude && git lfs pull`
+   in the scenario repository.
 
 The script will then automatically:
 1. Install system dependencies (`git`, `git-lfs`, `jq`, `curl`, `openssh-client`, etc.)
 2. Check that both repositories are reachable
-3. Ask the three questions above (usage mode + branch + PX4)
+3. Ask the five questions above (usage mode + branch + PX4 + GPU detection + Unity player)
 4. Clone the LOTUSim core repository into `~/lotusim_ws` and check out its chosen branch
 5. Configure your `~/.bashrc` with the `LOTUSIM_*` variables and the `lotusim_core`
    and `lotusim_shell` commands — no ROS 2 is sourced there, so a single
@@ -92,6 +106,93 @@ The script will then automatically:
 | nix | `/nix`, with flakes and the ROS cache enabled |
 | Deployment folder (user mode only) | `~/Documents/workspace/deployment` |
 | PX4-Autopilot (only if you answer yes to question 3) | `~/PX4-Autopilot` |
+| CUDA build of PyTorch (only if you answer yes to question 4) | the scenario workspace's `gpu` devshell |
+
+---
+
+## Manual installation
+
+What the script does, step by step, for a machine where you would rather run
+each command yourself. Everything is per machine except the two builds.
+
+**1. Nix, with flakes and the binary caches**
+
+```bash
+curl --proto '=https' --tlsv1.2 -L https://nixos.org/nix/install | sh -s -- --daemon
+sudo tee -a /etc/nix/nix.conf <<'EOF'
+experimental-features = nix-command flakes
+extra-substituters = https://ros.cachix.org https://naval-group.cachix.org
+extra-trusted-public-keys = ros.cachix.org-1:dSyZxI8geDCJrwgvCOHDoAfOm5sV1wCPjBkKL+38Rvo= naval-group.cachix.org-1:ytTEzFEeuzQrC9IRYLzHGa5OnM65G95M6/sbPd0fy28=
+EOF
+sudo systemctl restart nix-daemon
+```
+
+The caches are not optional in practice: without them nix rebuilds the whole
+ROS 2 stack, and xdyn, from source.
+
+**2. Clone the two workspaces** (Git LFS carries the Unity executables)
+
+```bash
+sudo apt update && sudo apt install -y git git-lfs jq
+git clone -b <branch> https://github.com/IRL-Crossing-CNRS/LOTUSim \
+    ~/lotusim_ws/src/LOTUSim
+mkdir -p ~/Documents/workspace/lotusim && cd ~/Documents/workspace/lotusim
+git clone --recurse-submodules -b <branch> \
+    https://github.com/IRL-Crossing-CNRS/LOTUSim-generic-scenario
+cd LOTUSim-generic-scenario && git lfs pull
+```
+
+**3. Build the core, in its devshell**
+
+The core provides its own ROS 2 and Gazebo through a nix flake, and builds with
+mise. Both workspaces must be built inside that environment: a build against a
+system ROS and one against the flake's produce different message definitions,
+and the two never talk to each other.
+
+```bash
+cd ~/lotusim_ws/src/LOTUSim
+nix develop --command mise run build
+```
+
+**4. Build the scenario workspace, in its own devshell** (the core's plus the
+agents' Python packages, built against the core above)
+
+```bash
+cd ~/Documents/workspace/lotusim/LOTUSim-generic-scenario
+nix develop --override-input lotusim ~/lotusim_ws/src/LOTUSim
+source ~/lotusim_ws/src/LOTUSim/install/setup.bash
+colcon build --symlink-install
+```
+
+The default devshell runs the YOLO detection tasks on the CPU. `nix develop
+.#gpu` (same `--override-input`) runs them on an NVIDIA GPU instead: it adds
+NVIDIA's CUDA build of PyTorch, about 7 GB, and needs the NVIDIA driver on the
+machine. Write `gpu` or `default` to `~/.config/lotusim/devshell` so that
+`lotusim_shell` opens the same one.
+
+**5. The `~/.bashrc` block** — copy the `LOTUSIM_*` variables and the
+`lotusim_core` / `lotusim_shell` functions from the script (search for
+`LOTUSim setup`), or run the script once: it skips what is already done.
+
+---
+
+## Graphics bridge (rendering sensors)
+
+A nix-built Gazebo cannot reach the host GPU driver by itself, and it renders
+every camera and gpu_lidar whether or not a window is open. Away from NixOS,
+install the bridge once (the script does not):
+
+```bash
+nix profile add github:nix-community/nixGL#nixGLIntel
+```
+
+On a hybrid or NVIDIA machine install the matching NVIDIA wrapper instead and
+name it explicitly, since the core's detection prefers Intel:
+
+```bash
+NIXPKGS_ALLOW_UNFREE=1 nix profile add --impure github:nix-community/nixGL#nixGLNvidia
+export LOTUSIM_GL_WRAPPER=nixGLNvidia-<driver version>
+```
 
 ---
 
@@ -126,11 +227,107 @@ checkout you build once. Question 3 of this installer automates that build:
    The installer watches for the `pxh>` shell `gz_x500` auto-launches when the
    build finishes, stops it, and verifies `build/px4_sitl_default/bin/px4`
    exists (this avoids both an interactive hang and the runaway-log issue
-   described in the generic scenario README)
+   described in [Manual build](#manual-build))
 5. Exports `PX4_AUTOPILOT_PATH="$HOME/PX4-Autopilot"` in `~/.bashrc`
 
 The step is idempotent: re-running the installer only refreshes submodules and
 skips the build if the binary is already there.
+
+### Manual build
+
+**PX4 SITL stays a system build**, and the launcher keeps it that way: inside a
+devshell it is handed the system loader, binary and gz configuration paths, so
+its gz dependencies resolve against the ROS 2 install it was linked with. The
+two builds still meet over gz-transport. Build it with the same compiler as
+before (`CC=clang CXX=clang++ make px4_sitl_default`) — the flags PX4 passes are
+clang's.
+
+A plain `git clone --recursive` costs about 4.4 GB. A SITL build never touches
+the NuttX board sources or the Gazebo-classic / jMAVSim / FlightGear / JSBSim
+simulators (LOTUSim drives `Tools/simulation/gz`, which is kept), so populate
+everything except those and land around 1.1 GB instead:
+
+```bash
+git clone --depth 1 https://github.com/PX4/PX4-Autopilot.git ~/PX4-Autopilot
+cd ~/PX4-Autopilot
+
+skip="platforms/nuttx/NuttX/nuttx
+platforms/nuttx/NuttX/apps
+Tools/simulation/gazebo-classic/sitl_gazebo-classic
+Tools/simulation/jmavsim/jMAVSim
+Tools/simulation/flightgear/flightgear_bridge
+Tools/simulation/jsbsim/jsbsim_bridge"
+
+mapfile -t want < <(git config -f .gitmodules --get-regexp '^submodule\..*\.path$' \
+                      | awk '{print $2}' | grep -vxF "$skip")
+git submodule update --init --recursive --depth 1 -- "${want[@]}"
+```
+
+Naming the wanted paths is the only thing that holds: `submodule update --init`
+runs `submodule init`, which sets `submodule.<name>.active=true` and undoes both
+a `deinit` and an `active=false` you set beforehand. `--depth 1` is safe — PX4
+builds its version string with `git describe --always`, so a tagless clone works
+(you get a hash instead of `v1.18.0-…`).
+
+If you would rather not bother, `git clone --recursive` still works; it just
+costs the extra 3 GB.
+
+System packages needed beyond a base Ubuntu 24.04 dev machine (all via
+`sudo apt install`, no PPAs needed):
+
+```bash
+sudo apt install -y ninja-build ccache libopencv-dev \
+    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+```
+
+Python packages (PX4's `Tools/setup/requirements.txt`; `--break-system-packages`
+is required on Ubuntu 24.04's PEP 668-managed Python, and this only touches
+your user site-packages, not the system Python):
+
+```bash
+pip3 install --user --break-system-packages -r Tools/setup/requirements.txt
+```
+
+**Known build issue (clang 18+):** a few PX4 source files use
+variable-length arrays in C++, which clang 18 treats as a hard error
+(`-Werror` + `-Wvla-cxx-extension`) even though older clang only warned.
+If `make` fails with `variable length arrays in C++ are a Clang extension`,
+add one line to `cmake/px4_add_common_flags.cmake` in the clang branch
+(next to the existing `-Wno-c99-designator` etc.):
+
+```cmake
+-Wno-error=vla-cxx-extension
+```
+
+Then build the Gazebo x500 target:
+
+```bash
+make px4_sitl gz_x500
+```
+
+This command builds PX4 and then launches it in an interactive `pxh>` shell
+attached to whatever Gazebo world and model it finds. With no matching Gazebo
+instance running, PX4 attaches to nothing and the `pxh>` prompt redraws in a
+loop indefinitely. If the run is backgrounded or redirected to a log file,
+that file grows without bound (several GB within minutes) until the disk
+fills. After the first build, check for a leftover process with
+`ps aux | grep bin/px4`, kill it, and delete the log. Later scenario launches
+are unaffected: LOTUSim starts its own PX4 instance with `-d` (daemon mode,
+no `pxh>` prompt).
+
+### QGroundControl
+
+Only needed to fly a PX4 agent by hand (`px4_control: "manual"`).
+QGroundControl is not in Ubuntu's apt repositories. Download the official
+AppImage:
+
+```bash
+curl -L -o ~/Applications/QGroundControl-x86_64.AppImage \
+  "$(curl -s https://api.github.com/repos/mavlink/qgroundcontrol/releases/latest \
+     | grep browser_download_url | grep x86_64.AppImage | cut -d'"' -f4)"
+chmod +x ~/Applications/QGroundControl-x86_64.AppImage
+~/Applications/QGroundControl-x86_64.AppImage
+```
 
 ### PX4 disk usage
 
@@ -176,9 +373,42 @@ cd ~/Documents/workspace/lotusim/LOTUSim-generic-scenario
 PX4 SITL starts automatically once the drone spawns (one instance per PX4
 agent); per-instance logs land in `scenario_logs/<timestamp>/px4_sitl_*.log`.
 Fly it from QGroundControl (`px4_control: "manual"`) or let the built-in
-`px4_offboard_patrol` task fly waypoints (`px4_control: "offboard"`). Full
-details — including QGroundControl install and the `"px4": true` agents'
-`spawn.z = 0` requirement — are in the generic scenario README.
+`px4_offboard_patrol` task fly waypoints (`px4_control: "offboard"`). How to
+enable PX4 on an agent — including the `"px4": true` agents' `spawn.z = 0`
+requirement — is in the generic scenario README; QGroundControl is installed as described in
+[QGroundControl](#qgroundcontrol).
+
+---
+
+## Unity project (Unity developers only)
+
+Running scenarios needs none of this: the scenario workspace ships the built
+Unity player (`lotusim_unity_executables/`). Install the Unity project only to
+change the 3D side.
+
+1. Install **Unity Hub**, then the **Unity Editor `2022.3.18f1`** with
+   *Linux Build Support (Mono)* — and *Windows Build Support* to build the
+   Windows player too.
+2. Clone the project (its assets are in Git LFS):
+   ```bash
+   git clone --recurse-submodules https://github.com/IRL-Crossing-CNRS/LOTUSim-Energy
+   cd LOTUSim-Energy && git lfs pull
+   ```
+3. In Unity Hub, *Add* the clone and open it with `2022.3.18f1`.
+
+Optional devices:
+
+- **Leap Motion** (Linux and Windows): an `Ultraleap Hand Tracking Camera`, a
+  computer that meets the
+  [tracking requirements](https://www.ultraleap.com/gemini-downloads/), and the
+  [Ultraleap Hand Tracking Software](https://www.ultraleap.com/downloads/)
+  (V5.2+). The project was developed with the *Leap Motion Controller*.
+- **Tobii Eye Tracker 5** (Windows only): the `Tobii Experience` app from the
+  Microsoft Store, then the `Tobii Experience Driver v1.133` and
+  `Tobii Ghost v1.14.1` from
+  [gaming.tobii.com](https://gaming.tobii.com/getstarted/?bundle=tobii-et5).
+
+How to use them in a scene is in the LOTUSim-Energy README.
 
 ---
 
@@ -258,6 +488,11 @@ This script:
    wheel-bearing folder) into `~/Documents/workspace/deployment`, overwriting
    just those folders — everything else you've added there is left untouched
 
+Setting up the **remote machine** an agent runs on (ROS 2, the virtualenv, the
+wheels) is part of the deployment walkthrough, which follows one agent from the
+simulation machine to the remote one: see the generic scenario's
+[deployment/README.md](https://github.com/IRL-Crossing-CNRS/LOTUSim-generic-scenario/blob/main/deployment/README.md).
+
 ---
 
 ## Troubleshooting
@@ -275,22 +510,13 @@ lotusim_core build
 
 **`no GPU driver bridge`, or a camera / gpu_lidar takes the world down**
 
-A nix-built Gazebo cannot reach the host GPU driver by itself, and it renders
-every camera and gpu_lidar whether or not a window is open:
-```bash
-nix profile add github:nix-community/nixGL#nixGLIntel
-```
-On a hybrid or NVIDIA machine install the matching NVIDIA wrapper and name it
-explicitly, since the detection prefers Intel:
-```bash
-NIXPKGS_ALLOW_UNFREE=1 nix profile add --impure github:nix-community/nixGL#nixGLNvidia
-export LOTUSIM_GL_WRAPPER=nixGLNvidia-<driver version>
-```
+The graphics bridge is missing: see [Graphics bridge](#graphics-bridge-rendering-sensors).
 
-**`crack_detector` does not detect anything**
+**Detection is slow**
 
-The scenario devshell's torch is the CPU build. `fault_inspection` falls back to
-the CPU; `crack_detector` needs a CUDA GPU.
+The default scenario devshell runs the YOLO detection on the CPU. On a machine
+with an NVIDIA GPU, write `gpu` to `~/.config/lotusim/devshell` (or re-run
+the installer with `INSTALL_GPU=1`) and open a new `lotusim_shell`.
 
 **`error: can't copy '/mnt/Data/.../build/simulation_run/config/*.json': doesn't exist or not a regular file` during the scenario build**
 
