@@ -135,20 +135,26 @@ SCENARIO_REPO_URL="${LOTUSIM_SCENARIO_REPO_URL:-https://github.com/IRL-Crossing-
 # Export so child processes (e.g. sudo -E) can see them
 export LOTUSIM_WS LOTUSIM_SRC LOTUSIM_PATH SCENARIO_WS LOTUSIM_MODELS_PATH ROS_DISTRO
 
-# Minimal bootstrap — just enough (git, ssh, curl) to check repo access and
-# list branches before asking the user anything. The rest of the system
-# dependencies are installed further down.
+# The only system packages this install needs: git and its LFS (clones), ssh
+# and curl (repository access, nix), jq (scenario_launch.sh reads the scenario
+# JSON with it) and pip (the user mode builds the deployment wheels).
+# ROS 2, Gazebo, colcon and every Python package the simulation imports come
+# from the nix flakes, not from apt or pip.
 # -----------------------------------------------------------------------------
-info "Installing minimal bootstrap dependencies (git, openssh-client, curl)..."
+info "Installing the system packages (git, git-lfs, openssh-client, curl, jq, pip)..."
 
 # Must run BEFORE the first 'apt-get update': a legacy ros2.list sitting next
 # to the deb822 ros2.sources (from the ros2-apt-source package) makes apt
 # abort with "Conflicting values set for option Signed-By".
 remove_conflicting_ros_repo_entries
 
-sudo apt-get update -qq
-sudo apt-get install -y --no-install-recommends git git-lfs openssh-client curl lsb-release
-success "Minimal bootstrap dependencies installed"
+# A third-party repository that fails to refresh (an expired key, a mirror
+# down) makes 'apt-get update' exit non-zero; the packages above all come from
+# Ubuntu, so carry on with the lists already on the machine.
+sudo apt-get update -qq \
+  || warn "apt-get update reported errors (a third-party repository?); continuing with the package lists already on this machine"
+sudo apt-get install -y --no-install-recommends git git-lfs openssh-client curl lsb-release jq python3-pip
+success "System packages installed"
 
 # Must run before any clone: LFS-tracked files otherwise check out as pointer stubs.
 info "Registering git-lfs..."
@@ -373,62 +379,6 @@ case "$UNITY_PLAYER" in
   windows) UNITY_LFS_EXCLUDE="lotusim_unity_executables/*_linux/**" ;;
   *)       UNITY_LFS_EXCLUDE="" ;;
 esac
-
-# -----------------------------------------------------------------------------
-# ROS 2 apt repository — only configure it if not already present.
-# -----------------------------------------------------------------------------
-ROS_KEYRING="/usr/share/keyrings/ros-archive-keyring.gpg"
-ROS_SOURCES="/etc/apt/sources.list.d/ros2.list"
-
-# '-R' (capital, unlike plain '-r') follows symlinks, so an entry installed as
-# /etc/apt/sources.list.d/ros2.sources -> /usr/share/ros-apt-source/ros2.sources
-# is correctly detected as "repository already configured".
-if grep -Rqs "packages.ros.org" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
-  info "ROS 2 apt repository already configured -- skipping GPG key and repo setup"
-  remove_conflicting_ros_repo_entries
-else
-  info "Pre-installing ROS 2 GPG key before first apt update..."
-  sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
-    -o "$ROS_KEYRING" \
-    || die "Failed to download ROS 2 GPG key. Check your internet connection."
-
-  # Remove any unsigned/broken ROS repo entry left by a previous failed run
-  sudo rm -f /etc/apt/sources.list.d/ros-latest.list
-
-  # Write the repo entry with signed-by reference (idempotent — overwrites if present)
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=${ROS_KEYRING}] \
-http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" \
-    | sudo tee "$ROS_SOURCES" > /dev/null
-
-  success "ROS 2 GPG key and signed repo entry configured"
-fi
-
-# -----------------------------------------------------------------------------
-# Remaining system dependencies (bootstrap only — ROS itself is installed by
-# lotusim install)
-# -----------------------------------------------------------------------------
-info "Installing remaining bootstrap system dependencies..."
-sudo apt-get update -qq
-sudo apt-get install -y --no-install-recommends \
-  jq \
-  python3-pip
-success "Bootstrap dependencies installed"
-
-# colcon lives in the ROS apt repo, which may not exist yet on a fresh system.
-# Try apt first; fall back to pip if the package is unavailable.
-info "Installing colcon..."
-if apt-cache show python3-colcon-common-extensions &>/dev/null 2>&1; then
-  sudo apt-get install -y --no-install-recommends python3-colcon-common-extensions
-  success "colcon installed via apt"
-else
-  warn "python3-colcon-common-extensions not found in apt — installing via pip..."
-  pip3 install --break-system-packages colcon-common-extensions
-  success "colcon installed via pip"
-fi
-
-info "Installing Python dependencies..."
-pip3 install --break-system-packages pyarrow pandas matplotlib opencv-python
-success "Python dependencies installed (pyarrow, pandas, matplotlib, opencv-python)"
 
 # -----------------------------------------------------------------------------
 # Create workspace and clone LOTUSim core
@@ -697,13 +647,6 @@ success "Scenario built"
 if [[ "$INSTALL_PX4_FLAG" == "1" ]]; then
   PX4_DIR="$HOME/PX4-Autopilot"
 
-  info "Installing PX4 SITL system dependencies..."
-  sudo apt-get update -qq
-  sudo apt-get install -y --no-install-recommends \
-    ninja-build ccache libopencv-dev \
-    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
-  success "PX4 system dependencies installed"
-
   # An interrupted install can leave $PX4_DIR without .git (partial build/
   # tree only). 'git clone' then refuses to clone into it. Wipe such
   # leftovers, but never touch a directory with unexpected content.
@@ -842,9 +785,17 @@ if [[ "$INSTALL_PX4_FLAG" == "1" ]]; then
 
   # Python packages required by PX4's build tools. Ubuntu 24.04's PEP 668-managed
   # Python needs --break-system-packages; this only touches the user site dir.
-  info "Installing PX4 Python requirements (Tools/setup/requirements.txt)..."
-  pip3 install --user --break-system-packages -r "$PX4_DIR/Tools/setup/requirements.txt"
-  success "PX4 Python requirements installed"
+  # PX4 is a system build, not a nix one: its own setup script installs what
+  # it builds and runs against -- compilers and build tools, its Python
+  # requirements, and Gazebo Harmonic from packages.osrfoundation.org, whose
+  # gz libraries the launcher hands PX4 at run time. --no-nuttx: SITL only.
+  info "Installing PX4's dependencies (Tools/setup/ubuntu.sh --no-nuttx: build tools, Python requirements, Gazebo Harmonic)..."
+  # The script fetches the Gazebo repository key with wget, which a minimal
+  # Ubuntu lacks, and installs gcc only: the build below is pinned to clang.
+  sudo apt-get install -y --no-install-recommends wget clang
+  ( cd "$PX4_DIR" && bash Tools/setup/ubuntu.sh --no-nuttx ) \
+    || die "PX4's dependency script (Tools/setup/ubuntu.sh) failed; see its output above."
+  success "PX4 dependencies installed"
 
   # Known build issue (clang >= 18): variable-length arrays in C++ are a hard
   # error (-Werror + -Wvla-cxx-extension). Patch once, exactly as the README
