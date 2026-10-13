@@ -3,19 +3,32 @@
 Automated installer for **LOTUSim Core** + **LOTUSim Generic Scenario**.
 
 Supports:
-- Ubuntu 24.04 → ROS 2 Jazzy
+- Ubuntu 24.04 (ROS 2 Jazzy, Gazebo Harmonic and xdyn come from the core's nix flake)
 - Windows **WSL2** with Ubuntu 24.04 (same script — see [WSL notes](#wsl-notes))
+
+The core and the scenario workspace are built in their nix devshells; the
+script adds the `LOTUSIM_*` variables and the `lotusim_core` and
+`lotusim_shell` commands to `~/.bashrc`. Naval Group's own `lotusim`
+program is left untouched.
 
 ---
 
 ## Requirements
 
 - Ubuntu 24.04 (fresh or existing install)
-- Internet access
-- `sudo` privileges
+- Internet access — the first entry into the flake downloads several GB
+- About 30 GB of free disk: the scenario environment alone is about 11 GB,
+  7 GB of it the CUDA build of PyTorch used by the YOLO detection tasks
+- For GPU detection, an NVIDIA GPU with its driver installed on the machine —
+  the environment brings CUDA itself, but uses the driver's `libcuda`
+- `sudo` privileges (installing nix, and its ROS cache, needs root once)
 
-Both repositories are public and cloned over HTTPS, so no account or key is
+Both repositories are public and cloned over HTTPS: no account or key is
 needed. The script checks they are reachable before installing anything.
+
+This installer follows the core's own environment:
+nix, the core's flake and its `mise` tasks (see
+[naval-group/LOTUSim's README](https://github.com/naval-group/LOTUSim#quickstart)).
 
 ---
 
@@ -26,7 +39,7 @@ chmod +x install_core_and_generic_scenario.sh
 ./install_core_and_generic_scenario.sh
 ```
 
-Once both repositories are confirmed reachable, the script asks three questions:
+As soon as SSH access to both repositories is confirmed, the script asks three questions:
 
 1. **Usage mode** — how do you intend to use LOTUSim?
    - `(1)` **User** — a black box to test some algorithms, plug and play
@@ -43,21 +56,27 @@ Once both repositories are confirmed reachable, the script asks three questions:
    (or `INSTALL_PX4=0` to skip the question).
 
 The script will then automatically:
-1. Detect your Ubuntu version and select the matching ROS 2 distribution
-2. Install system dependencies (`git`, `git-lfs`, `jq`, `curl`, etc.)
-3. Check both repositories are reachable
-4. Ask the three questions above (usage mode + branch + PX4)
-5. Install Python dependencies (`pyarrow`, `pandas`, `matplotlib`, `opencv-python`)
-6. Clone the LOTUSim core repository into `~/lotusim_ws` and check out its chosen branch
-7. Configure your `~/.bashrc` with the `LOTUSIM_*` environment variables and the `lotusim` command
-8. Run `lotusim install` to set up ROS 2 and Gazebo — **skipped if ROS 2 is
-   already installed** (force with `FORCE_LOTUSIM_INSTALL=1 ./install_core_and_generic_scenario.sh`);
-   an already-configured ROS 2 apt repository is also left untouched
-9. Clone and build the LOTUSim Generic Scenario workspace, checking out its chosen branch
-10. **If you answered yes to PX4:** install PX4's build dependencies, clone
-    `~/PX4-Autopilot` (recursive), apply the known clang-18 fix if needed, build
-    `px4_sitl gz_x500`, and export `PX4_AUTOPILOT_PATH` in `~/.bashrc`
-11. **User mode only:** build the deployment wheels (`deployment/build_wheels.sh`) and copy the
+1. Install system dependencies (`git`, `git-lfs`, `jq`, `curl`, `openssh-client`, etc.)
+2. Check that both repositories are reachable
+3. Ask the three questions above (usage mode + branch + PX4)
+4. Clone the LOTUSim core repository into `~/lotusim_ws` and check out its chosen branch
+5. Configure your `~/.bashrc` with the `LOTUSIM_*` variables and the `lotusim_core`
+   and `lotusim_shell` commands — no ROS 2 is sourced there, so a single
+   ROS 2 is ever on the path. A block written by the previous (apt-based)
+   installer is replaced, after a backup to `~/.bashrc.lotusim.bak`
+6. Install nix if absent, enable flakes, and add the ROS binary cache. ROS 2,
+   Gazebo and xdyn all come from the core's flake; nothing ROS-related is
+   installed system-wide
+7. Build the core with its own `mise run build`, inside `nix develop`
+8. Clone the LOTUSim Generic Scenario workspace and build it **in that same
+   environment**, against the core just built — a workspace built against
+   another ROS 2 gets different message definitions and never exchanges a
+   message with the simulation
+9. **If you answered yes to PX4:** install PX4's build dependencies, clone
+    `~/PX4-Autopilot` (shallow, SITL submodules only), apply the known clang-18
+    fix if needed, build `px4_sitl gz_x500`, and export `PX4_AUTOPILOT_PATH`
+    in `~/.bashrc`
+10. **User mode only:** build the deployment wheels (`deployment/build_wheels.sh`) and copy the
     whole `deployment/` folder from the generic scenario repo into `~/Documents/workspace/`.
     This step is skipped entirely in developer mode.
 
@@ -68,8 +87,9 @@ The script will then automatically:
 | Component | Location |
 |---|---|
 | LOTUSim Core | `~/lotusim_ws/src/LOTUSim` |
-| Generic Scenario | `~/Documents/workspace/lotusim/LOTUSim-generic-scenario` |
-| ROS 2 Jazzy | `/opt/ros/jazzy` |
+| Draft Generic Scenario | `~/Documents/workspace/lotusim/LOTUSim-generic-scenario` |
+| ROS 2 Jazzy, Gazebo Harmonic, xdyn | the core's nix flake (nothing system-wide) |
+| nix | `/nix`, with flakes and the ROS cache enabled |
 | Deployment folder (user mode only) | `~/Documents/workspace/deployment` |
 | PX4-Autopilot (only if you answer yes to question 3) | `~/PX4-Autopilot` |
 
@@ -98,7 +118,9 @@ checkout you build once. Question 3 of this installer automates that build:
 
 1. Installs PX4's system dependencies (`ninja-build`, `ccache`, `libopencv-dev`,
    GStreamer dev packages) and Python requirements (`Tools/setup/requirements.txt`)
-2. Clones `https://github.com/PX4/PX4-Autopilot.git` **recursively** into `~/PX4-Autopilot`
+2. Clones `https://github.com/PX4/PX4-Autopilot.git` into `~/PX4-Autopilot`
+   **shallow** (`--depth 1`) and populates only the submodules a SITL build
+   uses — see [PX4 disk usage](#px4-disk-usage) below
 3. Applies the known clang ≥ 18 VLA fix (`-Wno-error=vla-cxx-extension`) when needed
 4. Builds `make px4_sitl gz_x500` — first build takes roughly 30–60 minutes.
    The installer watches for the `pxh>` shell `gz_x500` auto-launches when the
@@ -109,6 +131,40 @@ checkout you build once. Question 3 of this installer automates that build:
 
 The step is idempotent: re-running the installer only refreshes submodules and
 skips the build if the binary is already there.
+
+### PX4 disk usage
+
+A plain `git clone --recursive` of PX4-Autopilot costs about **4.4 GB**, and a
+SITL build uses a fraction of it. The installer therefore clones shallow and
+populates only the submodules a SITL target actually references:
+
+| Left out | Why |
+|---|---|
+| Git history (`--depth 1`) | PX4 generates its version string with `git describe --always`, so a tagless clone builds fine — you just get a hash instead of `v1.18.0-…` |
+| `platforms/nuttx/NuttX/{nuttx,apps}` | flight-controller board sources; SITL is a POSIX build |
+| `Tools/simulation/{gazebo-classic,jmavsim,flightgear,jsbsim}` | simulators LOTUSim never launches — it uses the `gz` one, which is kept |
+
+That is roughly **1.1 GB instead of 4.4 GB**, and the checkout still rebuilds in
+place. To add one of them back later:
+
+```bash
+cd ~/PX4-Autopilot
+git submodule update --init --recursive <path>
+```
+
+Re-running the installer will not remove it again — it only skips it, and
+tells you the command to drop it if you want the space back.
+
+**Flight logs grow faster than the checkout.** Every PX4 SITL run writes a
+`.ulg` to `build/px4_sitl_default/rootfs/<instance>/log/`, and nothing prunes
+them — a few weeks of runs is easily more than the whole checkout. Cap them by
+setting the `SDLOG_DIRS_MAX` parameter (e.g. `5`; the parameter exists for
+exactly this case), or drop what has accumulated:
+
+```bash
+du -sh ~/PX4-Autopilot/build/px4_sitl_default/rootfs/*/log
+rm -rf ~/PX4-Autopilot/build/px4_sitl_default/rootfs/*/log
+```
 
 **Using it:** pick a scenario with a PX4 agent, e.g.
 
@@ -143,15 +199,33 @@ The same Ubuntu 24.04 script runs unchanged in WSL2:
 
 ---
 
+## The two commands
+
+The script defines them in `~/.bashrc`:
+
+```bash
+lotusim_core build          # build the core (mise run build, in its devshell)
+lotusim_core sim --gui energy.world
+lotusim_core test
+lotusim_shell               # the scenario workspace's devshell, both workspaces sourced
+                            # (CPU or GPU detection, from ~/.config/lotusim/devshell)
+```
+
+The scenario workspace is always built and run against the core installed
+next to it (`nix develop --override-input lotusim $LOTUSIM_PATH`).
+
+---
+
 ## After Installation
 
 Open a **new terminal** (or run `source ~/.bashrc`), then:
 
 ```bash
-cd ~/Documents/workspace/lotusim/LOTUSim-generic-scenario
+lotusim_shell
+./src/simulation_run/executable/scenario_launch.sh --config facet_demo/demo_facet.json
 ```
 
-Follow the scenario README to launch your first simulation.
+Follow the scenario README for the other scenarios and options.
 
 ---
 
@@ -188,16 +262,35 @@ This script:
 
 ## Troubleshooting
 
-**`Cannot reach https://github.com/IRL-Crossing-CNRS/...`**
+**`Cannot access https://github.com/IRL-Crossing-CNRS/...`**
 
-The repository could not be reached. Check your network connection, and that
-the repository still exists at that address.
+The machine cannot reach GitHub: check the internet connection, a proxy, or
+a firewall, then test with `git ls-remote https://github.com/IRL-Crossing-CNRS/LOTUSim`.
 
 **Permission denied on `log/` during build**
 ```bash
 sudo chown -R $USER:$USER ~/lotusim_ws
-cd ~/lotusim_ws && colcon build --symlink-install
+lotusim_core build
 ```
+
+**`no GPU driver bridge`, or a camera / gpu_lidar takes the world down**
+
+A nix-built Gazebo cannot reach the host GPU driver by itself, and it renders
+every camera and gpu_lidar whether or not a window is open:
+```bash
+nix profile add github:nix-community/nixGL#nixGLIntel
+```
+On a hybrid or NVIDIA machine install the matching NVIDIA wrapper and name it
+explicitly, since the detection prefers Intel:
+```bash
+NIXPKGS_ALLOW_UNFREE=1 nix profile add --impure github:nix-community/nixGL#nixGLNvidia
+export LOTUSIM_GL_WRAPPER=nixGLNvidia-<driver version>
+```
+
+**`crack_detector` does not detect anything**
+
+The scenario devshell's torch is the CPU build. `fault_inspection` falls back to
+the CPU; `crack_detector` needs a CUDA GPU.
 
 **`error: can't copy '/mnt/Data/.../build/simulation_run/config/*.json': doesn't exist or not a regular file` during the scenario build**
 
@@ -223,12 +316,12 @@ keys, tarballs) happily carry them along.
 **PX4 build fails with `.../optical_flow/PX4-OpticalFlow does not contain a CMakeLists.txt file`**
 
 The PX4-Autopilot checkout contains one or more **empty git submodules** (a
-single flaky network moment during the big recursive clone is enough), which
+single flaky network moment while the submodules are fetched is enough), which
 makes CMake configure fail with a cascade of *non-existent target OpticalFlow /
 klt_feature_tracker* errors right after. Re-running this installer repairs it
-automatically: it re-syncs and force-populates every submodule, verifies none
-are left empty, and wipes the half-finished `build/` directory before
-rebuilding. The manual equivalent, should you want it:
+automatically: it re-syncs and force-populates every submodule the build needs,
+verifies none are left empty, and wipes the half-finished `build/` directory
+before rebuilding. The manual equivalent, should you want it:
 ```bash
 cd ~/PX4-Autopilot
 git submodule update --init --recursive --force

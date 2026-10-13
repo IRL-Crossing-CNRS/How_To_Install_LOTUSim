@@ -4,6 +4,11 @@
 #  Ubuntu 24.04  →  ROS 2 Jazzy   (also works in WSL2 — see README)
 #  LOTUSim core + LOTUSim-generic-scenario
 #  Optional: PX4 SITL for aerial X500 drones (question 3 / INSTALL_PX4=1)
+#
+#  Installs the LOTUSim core (~/lotusim_ws) and the generic scenario
+#  workspace (~/Documents/workspace/lotusim), built in their nix devshells,
+#  with LOTUSIM_* shell variables and the lotusim_core / lotusim_shell
+#  commands. Naval Group's own 'lotusim' program is left untouched.
 # =============================================================================
 set -euo pipefail
 IFS=$'\n\t'
@@ -106,7 +111,7 @@ esac
 ROS_SETUP="/opt/ros/${ROS_DISTRO}/setup.bash"
 
 echo "============================================================="
-echo "  LOTUSim full setup (private repositories)"
+echo "  LOTUSim full setup"
 echo "  Ubuntu ${UBUNTU_VERSION}  ->  ROS 2 ${ROS_DISTRO^}"
 echo "============================================================="
 
@@ -117,13 +122,13 @@ LOTUSIM_WS="$HOME/lotusim_ws"
 LOTUSIM_SRC="$LOTUSIM_WS/src"
 LOTUSIM_PATH="$LOTUSIM_SRC/LOTUSim"
 SCENARIO_WS="$HOME/Documents/workspace/lotusim"
-
-CORE_REPO_URL="https://github.com/IRL-Crossing-CNRS/LOTUSim"
-SCENARIO_REPO_URL="https://github.com/IRL-Crossing-CNRS/LOTUSim-generic-scenario"
-
-# Trailing slash required: xdyn joins this to a model YAML's relative "mesh:"
-# path by plain concatenation.
 LOTUSIM_MODELS_PATH="$LOTUSIM_PATH/assets/models/"
+
+# The public repositories, over HTTPS. LOTUSIM_CORE_REPO_URL /
+# LOTUSIM_SCENARIO_REPO_URL override them, e.g. to test the installer against
+# local mirrors.
+CORE_REPO_URL="${LOTUSIM_CORE_REPO_URL:-https://github.com/IRL-Crossing-CNRS/LOTUSim}"
+SCENARIO_REPO_URL="${LOTUSIM_SCENARIO_REPO_URL:-https://github.com/IRL-Crossing-CNRS/LOTUSim-generic-scenario}"
 
 # Export so child processes (e.g. sudo -E) can see them
 export LOTUSIM_WS LOTUSIM_SRC LOTUSIM_PATH SCENARIO_WS LOTUSIM_MODELS_PATH ROS_DISTRO
@@ -148,14 +153,14 @@ info "Registering git-lfs..."
 git lfs install
 success "git-lfs registered"
 
-# Check both repositories are reachable before doing anything heavy.
+# Check that both repositories are reachable before doing anything heavy.
 # -----------------------------------------------------------------------------
 check_repo_access() {
   local url="$1"
   info "Checking access to ${url}..."
   if ! git ls-remote "$url" HEAD &>/dev/null; then
-    die "Cannot reach ${url}
-   Check your network connection and that the repository still exists."
+    die "Cannot access ${url}
+   Check the internet connection, then: git ls-remote ${url}"
   fi
   success "Access to ${url##*/} confirmed"
 }
@@ -359,44 +364,58 @@ git -C LOTUSim merge --ff-only "origin/$CORE_BRANCH" 2>/dev/null \
 success "LOTUSim on branch ${CORE_BRANCH}"
 
 # Sanity-check expected directory structure
-[[ -d "$LOTUSIM_PATH/launch" ]] \
-  || die "Expected $LOTUSIM_PATH/launch not found after clone. Check the repo structure."
-[[ -d "$LOTUSIM_PATH/physics" ]] \
-  || warn "$LOTUSIM_PATH/physics not found -- PATH/LD_LIBRARY_PATH entries will be no-ops until built."
+[[ -f "$LOTUSIM_PATH/flake.nix" && -f "$LOTUSIM_PATH/mise.toml" ]] \
+  || die "Expected $LOTUSIM_PATH/flake.nix and mise.toml not found after clone. Check the repo structure."
 
 # -----------------------------------------------------------------------------
 # ~/.bashrc configuration (idempotent)
 # ROS_DISTRO and UBUNTU_VERSION are embedded literally at write-time.
 # All other variables use escaped $ so they expand at shell startup.
+#
+# The block defines the LOTUSIM_* variables and two commands:
+#   - 'lotusim_core', which runs the core's tasks (build, test, sim <world>,
+#     ...) inside the core's nix devshell
+#   - 'lotusim_shell', which opens the scenario workspace's devshell
+# Neither is called 'lotusim': that is Naval Group's own program. The block
+# sources no ROS 2: ROS 2, Gazebo and xdyn come from the core's devshell.
 # -----------------------------------------------------------------------------
 BASHRC_MARKER="# >>> LOTUSim setup >>>"
+BASHRC_END="# <<< LOTUSim setup <<<"
+
+# A block written by an earlier installer (the apt-based one, whose
+# lotusim_core called launch/lotusim) is replaced rather than kept: it would
+# source a system ROS 2 and point at directories the core no longer has.
+if grep -qF "$BASHRC_MARKER" ~/.bashrc && ! grep -qF "lotusim_shell" ~/.bashrc; then
+  info "Replacing the previous LOTUSim block in ~/.bashrc (backup: ~/.bashrc.lotusim.bak)..."
+  cp ~/.bashrc ~/.bashrc.lotusim.bak
+  sed -i "/^${BASHRC_MARKER}\$/,/^${BASHRC_END}\$/d" ~/.bashrc
+fi
 
 if ! grep -qF "$BASHRC_MARKER" ~/.bashrc; then
-  info "Adding LOTUSim block to ~/.bashrc (ROS 2 distro: ${ROS_DISTRO})..."
+  info "Adding LOTUSim block to ~/.bashrc..."
   cat >> ~/.bashrc <<BASHRC_BLOCK
 
 # >>> LOTUSim setup >>>
-# Auto-configured for Ubuntu ${UBUNTU_VERSION} / ROS 2 ${ROS_DISTRO}
 export LOTUSIM_WS="\$HOME/lotusim_ws"
 export LOTUSIM_PATH="\$LOTUSIM_WS/src/LOTUSim"
+# Trailing slash is load-bearing: xdyn concatenates it onto mesh paths.
 export LOTUSIM_MODELS_PATH="\$LOTUSIM_PATH/assets/models/"
-export PATH="\$LOTUSIM_PATH/physics:\$LOTUSIM_PATH/launch:\$PATH"
-export LD_LIBRARY_PATH="\${LD_LIBRARY_PATH:+\${LD_LIBRARY_PATH}:}\$LOTUSIM_PATH/physics"
+export LOTUSIM_SCENARIO_WS="\$HOME/Documents/workspace/lotusim/LOTUSim-generic-scenario"
 
-# ROS 2 ${ROS_DISTRO}
-if [[ -f /opt/ros/${ROS_DISTRO}/setup.bash ]]; then
-  source /opt/ros/${ROS_DISTRO}/setup.bash
-fi
+# 'lotusim_core <task> [args]' runs a task of the core in its devshell:
+#   lotusim_core build | test | check | sim [--gui] <world>
+lotusim_core() {
+  ( cd "\$LOTUSIM_PATH" && nix develop --command mise run "\$@" )
+}
 
-# LOTUSim workspace overlay (available after first build)
-if [[ -f "\$LOTUSIM_WS/install/setup.bash" ]]; then
-  source "\$LOTUSIM_WS/install/setup.bash"
-fi
-
-# Bash completion for lotusim CLI
-if [[ -f "\$LOTUSIM_PATH/launch/bash_completion.sh" ]]; then
-  source "\$LOTUSIM_PATH/launch/bash_completion.sh"
-fi
+# 'lotusim_shell' opens the scenario workspace's devshell, built
+# against the core, with both workspaces sourced: scenario_launch.sh is
+# run from there.
+lotusim_shell() {
+  cd "\$LOTUSIM_SCENARIO_WS" && \\
+    nix develop --override-input lotusim "\$LOTUSIM_PATH" \\
+      --command bash --rcfile "\$HOME/.config/lotusim/shellrc"
+}
 # <<< LOTUSim setup <<<
 BASHRC_BLOCK
   success "~/.bashrc updated"
@@ -404,73 +423,89 @@ else
   info "~/.bashrc already contains LOTUSim config -- skipping"
 fi
 
+# The rc file lotusim_shell starts its shell with. It sources the two
+# workspaces only, never ~/.bashrc: an older block there may source a system
+# ROS 2, which must not be mixed with the devshell's.
+mkdir -p "$HOME/.config/lotusim"
+cat > "$HOME/.config/lotusim/shellrc" <<'SHELLRC'
+PS1="(lotusim_core) $PS1"
+[[ -f "$LOTUSIM_PATH/install/setup.bash" ]] && source "$LOTUSIM_PATH/install/setup.bash"
+[[ -f install/setup.bash ]] && source install/setup.bash
+SHELLRC
+
 # Apply exports for the remainder of this session
-export PATH="$LOTUSIM_PATH/physics:$LOTUSIM_PATH/launch:$PATH"
-export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}$LOTUSIM_PATH/physics"
+export LOTUSIM_MODELS_PATH="$LOTUSIM_PATH/assets/models/"
 
 # -----------------------------------------------------------------------------
 # Make launch scripts executable
 # -----------------------------------------------------------------------------
 info "Setting execute permissions on launch scripts..."
-chmod -R +x "$LOTUSIM_PATH/launch"
+chmod +x "$LOTUSIM_PATH"/scripts/*.sh 2>/dev/null || true
 success "Permissions set"
 
 # -----------------------------------------------------------------------------
-# Run LOTUSim dependency installer — skipped when ROS 2 is already installed
-# (re-run it anyway with:  FORCE_LOTUSIM_INSTALL=1 ./install_core_and_generic_scenario.sh)
-# sudo -E preserves exported vars (LOTUSIM_WS/LOTUSIM_PATH point at the
-# workspace for this script, see Variables section above)
+# Nix — the core provides ROS 2, Gazebo and xdyn through its flake, so this is
+# the only toolchain the installer puts on the machine.
 # -----------------------------------------------------------------------------
-if [[ -f "$ROS_SETUP" && "${FORCE_LOTUSIM_INSTALL:-0}" != "1" ]]; then
-  info "ROS 2 ${ROS_DISTRO^} already installed at /opt/ros/${ROS_DISTRO} -- skipping 'lotusim install'"
-  info "(force it with: FORCE_LOTUSIM_INSTALL=1 $0)"
-
-  # 'lotusim install' is skipped above, so packages it would normally pull in
-  # are checked individually here and installed only if missing.
-  info "Checking packages normally pulled in by 'lotusim install'..."
-  sudo apt-get update -qq
-  for pkg in libwebsocketpp-dev "ros-${ROS_DISTRO}-geographic-msgs" "ros-${ROS_DISTRO}-ros-gz"; do
-    if dpkg -s "$pkg" &>/dev/null; then
-      info "$pkg already installed -- skipping"
-    else
-      info "Installing missing package: $pkg..."
-      sudo apt-get install -y --no-install-recommends "$pkg"
-      success "$pkg installed"
-    fi
-  done
+if command -v nix &>/dev/null; then
+  info "nix already installed -- skipping"
 else
-  info "Running 'lotusim install' for ROS 2 ${ROS_DISTRO^} (this may take a while)..."
-  cd "$LOTUSIM_PATH/launch"
-  sudo -E ./lotusim install
-  success "lotusim install complete"
+  info "Installing nix (multi-user; this asks for your password)..."
+  curl --proto '=https' --tlsv1.2 -L https://nixos.org/nix/install | sh -s -- --daemon
+  success "nix installed"
+fi
+
+# shellcheck disable=SC1091
+[[ -f /etc/profile.d/nix.sh ]] && ros_source /etc/profile.d/nix.sh
+export PATH="/nix/var/nix/profiles/default/bin:$PATH"
+
+# Flakes are what "nix develop" needs; the binary caches are what keep it
+# minutes rather than hours: ROS 2 and Gazebo come from the ROS cache, xdyn
+# from Naval Group's (the same two caches as the core's README).
+NIX_CONF=/etc/nix/nix.conf
+# A single-user nix, or one installed by hand, may have no /etc/nix at all.
+sudo mkdir -p /etc/nix
+if ! grep -q 'experimental-features' "$NIX_CONF" 2>/dev/null; then
+  info "Enabling flakes..."
+  echo 'experimental-features = nix-command flakes' | sudo tee -a "$NIX_CONF" >/dev/null
+  NIX_CONF_CHANGED=1
+fi
+if ! grep -q 'ros.cachix.org' "$NIX_CONF" 2>/dev/null; then
+  info "Adding the ROS binary cache..."
+  sudo tee -a "$NIX_CONF" >/dev/null <<'NIXCONF'
+extra-substituters = https://ros.cachix.org
+extra-trusted-public-keys = ros.cachix.org-1:dSyZxI8geDCJrwgvCOHDoAfOm5sV1wCPjBkKL+38Rvo=
+NIXCONF
+  NIX_CONF_CHANGED=1
+fi
+if ! grep -q 'naval-group.cachix.org' "$NIX_CONF" 2>/dev/null; then
+  info "Adding Naval Group's binary cache..."
+  sudo tee -a "$NIX_CONF" >/dev/null <<'NIXCONF'
+extra-substituters = https://naval-group.cachix.org
+extra-trusted-public-keys = naval-group.cachix.org-1:ytTEzFEeuzQrC9IRYLzHGa5OnM65G95M6/sbPd0fy28=
+NIXCONF
+  NIX_CONF_CHANGED=1
+fi
+if [[ "${NIX_CONF_CHANGED:-0}" == "1" ]]; then
+  sudo systemctl restart nix-daemon || warn "Could not restart nix-daemon; restart it yourself before continuing."
 fi
 
 # -----------------------------------------------------------------------------
-# Source ROS 2 so colcon and other ROS tools are available in this session
+# Build the core, inside its own flake environment. The core builds at its own
+# root, and the scenario packages depend on lotusim_msgs, which only exists
+# after this build. The first entry into the devshell downloads the whole ROS 2
+# and Gazebo closure.
 # -----------------------------------------------------------------------------
-if [[ -f "$ROS_SETUP" ]]; then
-  ros_source "$ROS_SETUP"
+CORE_INSTALL="$LOTUSIM_PATH/install"
+if [[ ! -f "$CORE_INSTALL/setup.bash" ]]; then
+  info "Building the LOTUSim core in its devshell (the first run downloads a lot)..."
+  purge_foreign_colcon_artifacts "$LOTUSIM_PATH"
+  ( cd "$LOTUSIM_PATH" && nix develop --command mise run build ) \
+    || die "Core build failed. Enter it yourself with: cd $LOTUSIM_PATH && nix develop"
+  success "Core built"
 else
-  die "ROS 2 ${ROS_DISTRO^} setup.bash not found at $ROS_SETUP -- did 'lotusim install' succeed?"
+  info "Core already built -- skipping (rebuild with 'nix develop' then 'mise run build')"
 fi
-
-# -----------------------------------------------------------------------------
-# Build the core workspace — the scenario packages (e.g. gz_ros2_bridge)
-# depend on lotusim_msgs, which only exists after this build.
-# LOTUSIM_WS/LOTUSIM_PATH are exported above (see Variables
-# section), so the core CLI builds ~/lotusim_ws.
-# -----------------------------------------------------------------------------
-if [[ ! -f "$LOTUSIM_WS/install/setup.bash" ]]; then
-  info "Building LOTUSim core workspace (this may take a while)..."
-  purge_foreign_colcon_artifacts "$LOTUSIM_WS"
-  "$LOTUSIM_PATH/launch/lotusim" build
-  success "Core workspace built"
-else
-  info "Core workspace already built -- skipping (rebuild with 'lotusim clean_build')"
-fi
-
-# Source the core overlay so the scenario build can find lotusim_msgs
-ros_source "$LOTUSIM_WS/install/setup.bash"
 
 # -----------------------------------------------------------------------------
 # Scenario workspace -- clone & update submodules
@@ -515,12 +550,20 @@ success "LFS content up to date"
 # exist or not a regular file"). Healthy same-machine incremental builds are
 # left untouched.
 # -----------------------------------------------------------------------------
-info "Building LOTUSim generic scenario with colcon..."
+# Built inside the core's devshell, and against the core it just produced: a
+# workspace built against any other ROS 2 gets different message definitions and
+# never exchanges a message with the simulation.
+PWD_SCENARIO="$PWD"
+# This workspace has its own devshell: the core's, plus the Python packages the
+# agents import. Its lotusim input is pointed at the core just cloned, so both
+# are built against one ROS 2 rather than against whatever github holds.
+info "Building LOTUSim generic scenario with colcon, in its devshell..."
 purge_foreign_colcon_artifacts "$PWD"
-colcon build --symlink-install
-
-ros_source install/setup.bash
-success "Scenario built and sourced"
+( cd "$PWD_SCENARIO" && nix develop --override-input lotusim "$LOTUSIM_PATH" \
+    --command bash -c \
+    "source '$LOTUSIM_PATH/install/setup.bash' && colcon build --symlink-install" ) \
+  || die "Scenario build failed. Enter the shell yourself with: cd $PWD_SCENARIO && nix develop --override-input lotusim $LOTUSIM_PATH"
+success "Scenario built"
 
 # -----------------------------------------------------------------------------
 # PX4 SITL (optional — answer 3 / INSTALL_PX4=1)
@@ -559,31 +602,91 @@ if [[ "$INSTALL_PX4_FLAG" == "1" ]]; then
     rm -rf "$PX4_DIR"
   fi
 
+  # A plain 'git clone --recursive' of PX4-Autopilot costs ~4.4 GB, and a SITL
+  # build uses a fraction of it: the git history, the NuttX board sources and
+  # the three simulators LOTUSim never launches are most of the weight. None of
+  # them is referenced by any target in the generated px4_sitl_default build,
+  # and the version string survives a tagless clone because PX4 generates it
+  # with 'git describe --always' (src/lib/version/px_update_git_header.py).
+  # Net: ~1.1 GB instead of ~4.4 GB, still rebuildable in place.
+  # ---------------------------------------------------------------------------
+  PX4_UNUSED_SUBMODULES=(
+    platforms/nuttx/NuttX/nuttx                          # flight-controller board sources; SITL is a POSIX build
+    platforms/nuttx/NuttX/apps
+    Tools/simulation/gazebo-classic/sitl_gazebo-classic  # simulators LOTUSim never launches; it uses
+    Tools/simulation/jmavsim/jMAVSim                     # Tools/simulation/gz, which stays
+    Tools/simulation/flightgear/flightgear_bridge
+    Tools/simulation/jsbsim/jsbsim_bridge
+  )
+
+  # Every submodule .gitmodules records, minus those. There is no way to tell
+  # 'git submodule update --init' to skip one: --init runs 'submodule init',
+  # which sets submodule.<name>.active=true and overrides a 'false' set
+  # beforehand (checked on git 2.43), and a plain 'deinit' is undone the same
+  # way. Naming the wanted paths explicitly is what actually holds.
+  px4_wanted_submodules() {
+    local skip_list
+    skip_list="$(printf '%s\n' "${PX4_UNUSED_SUBMODULES[@]}")"
+    git -C "$PX4_DIR" config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null \
+      | awk '{print $2}' | grep -vxF "$skip_list"
+  }
+
   if [[ ! -d "$PX4_DIR/.git" ]]; then
-    info "Cloning PX4-Autopilot into $PX4_DIR (recursive -- this downloads a lot)..."
-    git clone --recursive https://github.com/PX4/PX4-Autopilot.git "$PX4_DIR" \
+    info "Cloning PX4-Autopilot into $PX4_DIR (shallow, SITL submodules only)..."
+    git clone --depth 1 https://github.com/PX4/PX4-Autopilot.git "$PX4_DIR" \
       || die "Failed to clone PX4-Autopilot. Check your internet connection."
     success "PX4-Autopilot cloned"
   else
     info "PX4-Autopilot already present at $PX4_DIR -- updating submodules..."
-    git -C "$PX4_DIR" submodule update --init --recursive
-    success "PX4-Autopilot submodules up to date"
   fi
 
-  # Self-repair: re-sync submodules ('git clone --recursive' can silently
-  # leave one unpopulated after a flaky fetch, breaking CMake configure) and
-  # clear a stale/foreign build dir. Idempotent, cheap when already healthy.
+  # Self-repair: (re-)populate the submodules the build needs. 'git clone' can
+  # silently leave one empty after a flaky fetch, which breaks CMake configure
+  # with a cascade of 'non-existent target' errors. Idempotent, cheap when
+  # already healthy.
+  # A shallow submodule fetch asks the server for an arbitrary SHA; github.com
+  # serves those, but a mirror or corporate proxy may not -- fall back to full
+  # depth rather than fail the install over disk space we only meant to save.
   # ---------------------------------------------------------------------------
-  info "Repairing/verifying PX4 submodules..."
+  info "Populating/verifying PX4 submodules..."
+  mapfile -t PX4_WANTED_SUBMODULES < <(px4_wanted_submodules)
+  [[ ${#PX4_WANTED_SUBMODULES[@]} -gt 0 ]] \
+    || die "No submodule paths found in $PX4_DIR/.gitmodules -- the clone looks incomplete."
   git -C "$PX4_DIR" submodule sync --recursive || true
-  git -C "$PX4_DIR" submodule update --init --recursive --force \
+  git -C "$PX4_DIR" submodule update --init --recursive --depth 1 --force \
+       -- "${PX4_WANTED_SUBMODULES[@]}" \
+    || git -C "$PX4_DIR" submodule update --init --recursive --force \
+       -- "${PX4_WANTED_SUBMODULES[@]}" \
     || die "PX4 submodules could not be synced (network?). Re-run this script once online."
+  success "PX4-Autopilot submodules up to date"
 
-  BROKEN_SUBS="$(git -C "$PX4_DIR" submodule status --recursive | grep -E '^- ' || true)"
-  if [[ -n "$BROKEN_SUBS" ]]; then
+  # 'submodule status' prefixes an unpopulated submodule with '-' and NO space
+  # before the SHA, so the '^- ' this check used to look for never matched
+  # anything. With '^-' it does -- including the ones we skip on purpose, which
+  # therefore have to come back out before judging what is left.
+  BROKEN_SUBS="$(git -C "$PX4_DIR" submodule status --recursive | grep -E '^-' || true)"
+  for PX4_SKIPPED in "${PX4_UNUSED_SUBMODULES[@]}"; do
+    BROKEN_SUBS="$(printf '%s\n' "$BROKEN_SUBS" | grep -v -F " ${PX4_SKIPPED}" || true)"
+  done
+  if [[ -n "$(printf '%s' "$BROKEN_SUBS" | tr -d '[:space:]')" ]]; then
     warn "These PX4 submodules are STILL empty after repair:"
     echo "$BROKEN_SUBS"
     die "Re-run this script with a stable internet connection to github.com."
+  fi
+
+  # A checkout from before this change still carries the unused submodules.
+  # Deleting ~580 MB someone may be using is not this script's call, so just
+  # point at the command.
+  PX4_PRUNABLE=()
+  for PX4_SKIPPED in "${PX4_UNUSED_SUBMODULES[@]}"; do
+    [[ -n "$(ls -A "$PX4_DIR/$PX4_SKIPPED" 2>/dev/null)" ]] && PX4_PRUNABLE+=("$PX4_SKIPPED")
+  done
+  if [[ ${#PX4_PRUNABLE[@]} -gt 0 ]]; then
+    info "This checkout carries ${#PX4_PRUNABLE[@]} submodule(s) no SITL build uses (~580 MB for the full set)."
+    info "Reclaim the space when you want to, with:"
+    for PX4_SKIPPED in "${PX4_PRUNABLE[@]}"; do
+      info "  git -C $PX4_DIR submodule deinit -f $PX4_SKIPPED"
+    done
   fi
 
   # In-source CMake fossils (CMakeCache.txt/CMakeFiles/cmake_install.cmake in
@@ -682,7 +785,7 @@ if [[ "$INSTALL_PX4_FLAG" == "1" ]]; then
   fi
 
   # Persist PX4_AUTOPILOT_PATH for future shells. Separate idempotent block,
-  # so adding PX4 later still works even though the main block exists.
+  # so adding PX4 later still works even though the main Draft block exists.
   PX4_MARKER="# >>> LOTUSim PX4 setup >>>"
   if ! grep -qF "$PX4_MARKER" ~/.bashrc; then
     cat >> ~/.bashrc <<PX4_BLOCK
@@ -739,7 +842,7 @@ echo "  Core branch: ${CORE_BRANCH}  |  Scenario branch: ${SCENARIO_BRANCH}"
 echo ""
 echo "  Core workspace:     ${LOTUSIM_WS}"
 echo "  Scenario workspace: ${SCENARIO_WS}/LOTUSim-generic-scenario"
-echo "  CLI command:        lotusim   (e.g. 'lotusim clean_build')"
+echo "  Core build:         lotusim_core build"
 if [[ "$USAGE_MODE" == "user" ]]; then
 echo "  Deployment folder:  ${HOME}/Documents/workspace/deployment"
 fi
@@ -749,7 +852,7 @@ fi
 echo ""
 echo "  Next steps:"
 echo "    1. Open a new terminal  (or: source ~/.bashrc)"
-echo "    2. cd ${SCENARIO_WS}/LOTUSim-generic-scenario"
+echo "    2. lotusim_shell     (the scenario devshell, on the core)"
 echo "    3. Follow the scenario README to launch the simulation"
 if grep -qi microsoft /proc/version 2>/dev/null; then
 echo ""
